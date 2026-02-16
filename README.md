@@ -1,4 +1,4 @@
-# RedArc v2 — Modernized Self-Hosted Reddit Archive
+# RedArc v2 - Modernized Self-Hosted Reddit Archive
 
 A complete reframe of [Yakabuff/redarc](https://github.com/Yakabuff/redarc), modernizing the frontend, search capabilities, and data ingestion workflow.
 
