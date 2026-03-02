@@ -99,6 +99,16 @@ def _resolve_attr(obj, attr_name):
     return _resolve_awaitable(value)
 
 
+def _get_attr_no_call(obj, attr_name):
+    """Read an attribute safely without invoking callables."""
+    if not hasattr(obj, attr_name):
+        return None
+    try:
+        return getattr(obj, attr_name)
+    except Exception:
+        return None
+
+
 def _to_bytes(value):
     if isinstance(value, bytes):
         return value
@@ -109,6 +119,197 @@ def _to_bytes(value):
     if isinstance(value, str):
         return value.encode('utf-8')
     return None
+
+
+def _to_text(value):
+    if isinstance(value, str):
+        return value
+    raw = _to_bytes(value)
+    if raw is None:
+        return None
+    return raw.decode('utf-8', errors='replace')
+
+
+def _normalized_name(value):
+    text = _to_text(value)
+    return text.strip() if isinstance(text, str) else ''
+
+
+def _resolve_upload_filename(upload, fallback):
+    for attr in ('filename', 'file_name', 'original_filename', 'name'):
+        candidate = _resolve_attr(upload, attr)
+        text = _normalized_name(candidate)
+        if not text:
+            continue
+        # Avoid using the multipart field name as a filename.
+        if text.lower() == 'file':
+            continue
+        return _safe_filename(text)
+    return _safe_filename(fallback)
+
+
+def _check_upload_size(total_bytes, max_upload_bytes):
+    if max_upload_bytes and total_bytes > max_upload_bytes:
+        raise ValueError("Upload exceeds configured UPLOAD_MAX_BYTES")
+
+
+def _write_chunk(out_fh, chunk, bytes_written, max_upload_bytes):
+    chunk_bytes = _to_bytes(chunk)
+    if chunk_bytes is None:
+        raise ValueError(f"Unsupported upload stream chunk type: {type(chunk).__name__}")
+    bytes_written += len(chunk_bytes)
+    _check_upload_size(bytes_written, max_upload_bytes)
+    out_fh.write(chunk_bytes)
+    return bytes_written
+
+
+def _copy_reader_to_file(reader, out_fh, bytes_written, max_upload_bytes, chunk_size=8192):
+    wrote = False
+    while True:
+        try:
+            chunk = _resolve_awaitable(reader(chunk_size))
+        except TypeError:
+            chunk = _resolve_awaitable(reader())
+        if not chunk:
+            break
+        bytes_written = _write_chunk(out_fh, chunk, bytes_written, max_upload_bytes)
+        wrote = True
+    return bytes_written, wrote
+
+
+def _resolve_stream_source(upload):
+    """Resolve upload stream/file source, handling callable accessors safely."""
+    for attr in ('stream', 'file'):
+        candidate = _get_attr_no_call(upload, attr)
+        if candidate is None:
+            continue
+        if callable(candidate):
+            try:
+                candidate = candidate()
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            candidate = _resolve_awaitable(candidate)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _parse_multipart_with_cgi(req):
+    """
+    Parse multipart form-data using the raw Content-Type header (with boundary).
+    This avoids Falcon BodyPart wrappers that may expose placeholder payloads.
+    """
+    form_data = {}
+    upload = None
+
+    content_type = req.get_header('Content-Type') or req.content_type or ''
+    if 'multipart/form-data' not in content_type.lower():
+        return form_data, upload
+
+    content_length = req.content_length or 0
+    if content_length <= 0:
+        return form_data, upload
+
+    try:
+        import cgi
+        form = cgi.FieldStorage(
+            fp=req.bounded_stream,
+            environ={
+                'REQUEST_METHOD': 'POST',
+                'CONTENT_TYPE': content_type,
+                'CONTENT_LENGTH': str(content_length),
+            },
+            keep_blank_values=True,
+        )
+    except Exception as e:
+        logger.warning(f"cgi multipart parse failed: {e}")
+        return form_data, upload
+
+    items = getattr(form, 'list', None) or []
+    for item in items:
+        key_name = _normalized_name(getattr(item, 'name', ''))
+        if not key_name:
+            continue
+
+        if key_name.lower() == 'file':
+            if upload is None:
+                upload = item
+            continue
+
+        value = getattr(item, 'value', None)
+        text_value = _to_text(value)
+        if text_value is not None:
+            form_data[key_name] = text_value
+
+    return form_data, upload
+
+
+def _write_upload_to_path(upload, file_path, max_upload_bytes):
+    bytes_written = 0
+    with open(file_path, 'wb') as out_fh:
+        # Prefer stream/file sources first so we preserve exact bytes
+        # (especially for compressed dumps like .zst).
+        stream = _resolve_stream_source(upload)
+
+        direct_bytes = _to_bytes(stream)
+        if direct_bytes is not None:
+            bytes_written = len(direct_bytes)
+            _check_upload_size(bytes_written, max_upload_bytes)
+            out_fh.write(direct_bytes)
+        elif stream is not None and hasattr(stream, 'read'):
+            if hasattr(stream, 'seek'):
+                try:
+                    stream.seek(0)
+                except Exception:
+                    pass
+            bytes_written, _ = _copy_reader_to_file(stream.read, out_fh, bytes_written, max_upload_bytes)
+        elif stream is not None and hasattr(stream, '__iter__'):
+            for chunk in stream:
+                if not chunk:
+                    continue
+                bytes_written = _write_chunk(out_fh, chunk, bytes_written, max_upload_bytes)
+
+        if bytes_written == 0 and hasattr(upload, 'read'):
+            bytes_written, _ = _copy_reader_to_file(upload.read, out_fh, bytes_written, max_upload_bytes)
+
+        # Keep text fallback last; it can corrupt binary uploads.
+        if bytes_written == 0:
+            for attr in ('get_text', 'text'):
+                candidate = _resolve_attr(upload, attr)
+                payload = _to_bytes(candidate)
+                if payload is None:
+                    continue
+                bytes_written = len(payload)
+                _check_upload_size(bytes_written, max_upload_bytes)
+                out_fh.write(payload)
+                break
+
+        if bytes_written == 0:
+            payload = _to_bytes(upload)
+            if payload is not None:
+                bytes_written = len(payload)
+                _check_upload_size(bytes_written, max_upload_bytes)
+                out_fh.write(payload)
+
+    if bytes_written == 0:
+        attrs = []
+        for attr in ('filename', 'name', 'text', 'value', 'data', 'get_data', 'stream', 'file', 'read'):
+            if hasattr(upload, attr):
+                attrs.append(attr)
+        raise ValueError(f"Unsupported uploaded file payload: {type(upload).__name__} attrs={','.join(attrs)}")
+
+    return bytes_written
+
+
+def _is_zstd_file(file_path):
+    try:
+        with open(file_path, 'rb') as f:
+            return f.read(4) == b'\x28\xb5\x2f\xfd'
+    except Exception:
+        return False
+
 
 def get_job(job_id):
     r = _get_redis()
@@ -152,7 +353,7 @@ def parse_submission(line_dict):
     # ID
     if 'id' in d and isinstance(d['id'], str):
         identifier = d['id'].strip().replace("\u0000", "").lower()
-    elif 'name' in d and isinstance(d['name'], str) and '_' in d['name']:
+    elif 'name' in d and isinstance(d['name'], str) and len(d['name'].split('_')) > 1:
         identifier = d['name'].strip().replace("\u0000", "").lower().split('_')[1]
     else:
         return None
@@ -163,7 +364,7 @@ def parse_submission(line_dict):
 
     title = d.get('title', '').strip().replace("\u0000", "") if isinstance(d.get('title'), str) else ""
     author = d.get('author', '[unknown]').strip().replace("\u0000", "").lower() if isinstance(d.get('author'), str) else "[unknown]"
-    permalink = d.get('permalink', f'/r/{subreddit}/comments/{identifier}/post').strip().replace("\u0000", "") if isinstance(d.get('permalink'), str) else f'/r/{subreddit}/comments/{identifier}/post'
+    permalink = d.get('permalink', f'/r/{subreddit}/comments/{identifier}/foobar').strip().replace("\u0000", "") if isinstance(d.get('permalink'), str) else f'/r/{subreddit}/comments/{identifier}/foobar'
 
     num_comments = d.get('num_comments', 0)
     if isinstance(num_comments, str) and num_comments.isdigit():
@@ -171,10 +372,10 @@ def parse_submission(line_dict):
     elif not isinstance(num_comments, int):
         num_comments = 0
 
-    url = d.get('url', f'http://reddit.com/r/{subreddit}/comments/{identifier}/').strip().replace("\u0000", "") if isinstance(d.get('url'), str) else f'http://reddit.com/r/{subreddit}/comments/{identifier}/'
+    url = d.get('url', f'http://reddit.com/r/{subreddit}/comments/{identifier}/blah').strip().replace("\u0000", "") if isinstance(d.get('url'), str) else f'http://reddit.com/r/{subreddit}/comments/{identifier}/blah'
 
     score = d.get('score', 0)
-    if isinstance(score, str) and score.lstrip('-').isdigit():
+    if isinstance(score, str) and score.isdigit():
         score = int(score)
     elif not isinstance(score, int):
         score = 0
@@ -187,8 +388,6 @@ def parse_submission(line_dict):
 
     created_utc = d.get('created_utc', 0)
     if isinstance(created_utc, str) and created_utc.isdigit():
-        created_utc = int(created_utc)
-    elif isinstance(created_utc, float):
         created_utc = int(created_utc)
     elif not isinstance(created_utc, int):
         created_utc = 0
@@ -219,7 +418,7 @@ def parse_comment(line_dict):
     author = d.get('author', '[unknown]').strip().lower() if isinstance(d.get('author'), str) else "[unknown]"
 
     score = d.get('score', 0)
-    if isinstance(score, str) and score.lstrip('-').isdigit():
+    if isinstance(score, str) and score.isdigit():
         score = int(score)
     elif not isinstance(score, int):
         score = 0
@@ -233,26 +432,83 @@ def parse_comment(line_dict):
     created_utc = d.get('created_utc', 0)
     if isinstance(created_utc, str) and created_utc.isdigit():
         created_utc = int(created_utc)
-    elif isinstance(created_utc, float):
-        created_utc = int(created_utc)
     elif not isinstance(created_utc, int):
         created_utc = 0
 
     body = d.get('body', '').strip().replace("\u0000", "") if isinstance(d.get('body'), str) else ""
 
-    link_id_raw = d.get('link_id', '')
-    if isinstance(link_id_raw, str):
-        link_id = link_id_raw.strip().split('_')[-1] if '_' in link_id_raw else link_id_raw.strip()
+    link_id_raw = d.get('link_id')
+    if isinstance(link_id_raw, str) and link_id_raw.strip():
+        link_id_stripped = link_id_raw.strip()
+        if len(link_id_stripped.split('_')) > 1:
+            link_id = link_id_stripped.split('_')[1]
+        else:
+            link_id = link_id_stripped
     else:
         return None
 
-    parent_id_raw = d.get('parent_id', '')
-    if isinstance(parent_id_raw, str):
-        parent_id = parent_id_raw.strip().split('_')[-1] if '_' in parent_id_raw else parent_id_raw.strip()
+    parent_id_raw = d.get('parent_id')
+    if isinstance(parent_id_raw, str) and parent_id_raw.strip():
+        parent_id_stripped = parent_id_raw.strip()
+        if len(parent_id_stripped.split('_')) > 1:
+            parent_id = parent_id_stripped.split('_')[1]
+        else:
+            parent_id = parent_id_stripped
     else:
         parent_id = link_id
 
     return (identifier, subreddit, body, author, score, gilded, created_utc, parent_id, link_id, int(time.time()))
+
+
+def iter_json_objects(text_stream, chunk_size=1024 * 1024):
+    """
+    Yield JSON objects from either NDJSON or concatenated JSON payloads.
+    Supports payloads shaped like: {...}\n{...} or {...}{...}.
+    """
+    decoder = json.JSONDecoder()
+    buffer = ""
+
+    while True:
+        chunk = text_stream.read(chunk_size)
+        if not chunk:
+            break
+        buffer += chunk
+
+        pos = 0
+        length = len(buffer)
+        while True:
+            while pos < length and buffer[pos].isspace():
+                pos += 1
+            if pos >= length:
+                break
+
+            try:
+                obj, end = decoder.raw_decode(buffer, pos)
+            except json.JSONDecodeError:
+                # Need more bytes to complete current object.
+                break
+
+            yield obj
+            pos = end
+
+        if pos > 0:
+            buffer = buffer[pos:]
+
+    # Final pass on remaining buffered content.
+    tail = buffer.strip()
+    if not tail:
+        return
+
+    pos = 0
+    length = len(tail)
+    while True:
+        while pos < length and tail[pos].isspace():
+            pos += 1
+        if pos >= length:
+            break
+        obj, end = decoder.raw_decode(tail, pos)
+        yield obj
+        pos = end
 
 
 def process_upload(job_id, file_path, data_type, pg_pool, pgfts_pool, auto_index, on_conflict='skip'):
@@ -287,8 +543,9 @@ def process_upload(job_id, file_path, data_type, pg_pool, pgfts_pool, auto_index
             fts_con = pgfts_pool.getconn()
             fts_cursor = fts_con.cursor()
 
-        # Open file — decompress .zst if needed
-        is_zst = file_path.endswith('.zst') or file_path.endswith('.zstd')
+        # Open file — decompress .zst if needed (by extension or magic bytes).
+        file_path_lower = file_path.lower()
+        is_zst = file_path_lower.endswith('.zst') or file_path_lower.endswith('.zstd') or _is_zstd_file(file_path)
         if is_zst:
             try:
                 import zstandard as zstd
@@ -385,67 +642,66 @@ def process_upload(job_id, file_path, data_type, pg_pool, pgfts_pool, auto_index
 
                 return [], []
 
-            for line in f:
-                line_number += 1
-                line = line.rstrip()
-                if not line:
-                    continue
-
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    errors += 1
-                    continue
-
-                # Auto-detect type if needed
-                effective_type = data_type
-                if data_type == 'auto':
-                    if 'title' in d or 'selftext' in d:
-                        effective_type = 'submissions'
-                    elif 'body' in d:
-                        effective_type = 'comments'
-                    else:
-                        errors += 1
-                        continue
-                    if detected_type is None:
-                        detected_type = effective_type
-                    elif detected_type != effective_type:
+            try:
+                payload_iter = iter_json_objects(f)
+                for d in payload_iter:
+                    line_number += 1
+                    if not isinstance(d, dict):
                         errors += 1
                         continue
 
-                if effective_type == 'submissions':
-                    parsed = parse_submission(d)
-                    if not parsed:
-                        skipped += 1
-                        continue
+                    # Auto-detect type if needed
+                    effective_type = data_type
+                    if data_type == 'auto':
+                        if 'title' in d or 'selftext' in d:
+                            effective_type = 'submissions'
+                        elif 'body' in d:
+                            effective_type = 'comments'
+                        else:
+                            errors += 1
+                            continue
+                        if detected_type is None:
+                            detected_type = effective_type
+                        elif detected_type != effective_type:
+                            errors += 1
+                            continue
 
-                    subreddits_seen.add(parsed[1])
-                    batch_pg.append(parsed)
+                    if effective_type == 'submissions':
+                        parsed = parse_submission(d)
+                        if not parsed:
+                            skipped += 1
+                            continue
 
-                    # FTS tuple (fewer fields)
-                    if fts_cursor:
-                        batch_fts.append((parsed[0], parsed[1], parsed[2], parsed[6], parsed[8], parsed[9], parsed[10], parsed[11]))
+                        subreddits_seen.add(parsed[1])
+                        batch_pg.append(parsed)
 
-                elif effective_type == 'comments':
-                    parsed = parse_comment(d)
-                    if not parsed:
-                        skipped += 1
-                        continue
+                        # FTS tuple (fewer fields)
+                        if fts_cursor:
+                            batch_fts.append((parsed[0], parsed[1], parsed[2], parsed[6], parsed[8], parsed[9], parsed[10], parsed[11]))
 
-                    subreddits_seen.add(parsed[1])
-                    batch_pg.append(parsed)
+                    elif effective_type == 'comments':
+                        parsed = parse_comment(d)
+                        if not parsed:
+                            skipped += 1
+                            continue
 
-                    # FTS tuple
-                    if fts_cursor:
-                        batch_fts.append((parsed[0], parsed[1], parsed[2], parsed[4], parsed[5], parsed[6], parsed[8]))
+                        subreddits_seen.add(parsed[1])
+                        batch_pg.append(parsed)
 
-                # Flush batch
-                if len(batch_pg) >= BATCH_SIZE:
-                    batch_pg, batch_fts = flush_batch(effective_type, batch_pg, batch_fts)
+                        # FTS tuple
+                        if fts_cursor:
+                            batch_fts.append((parsed[0], parsed[1], parsed[2], parsed[4], parsed[5], parsed[6], parsed[8]))
 
-                # Update progress every 1000 lines
-                if line_number % 1000 == 0:
-                    update_job(job_id, lines_processed=line_number, inserted=inserted, errors=errors)
+                    # Flush batch
+                    if len(batch_pg) >= BATCH_SIZE:
+                        batch_pg, batch_fts = flush_batch(effective_type, batch_pg, batch_fts)
+
+                    # Update progress every 1000 records
+                    if line_number % 1000 == 0:
+                        update_job(job_id, lines_processed=line_number, inserted=inserted, errors=errors)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parse error in upload job {job_id}: {e}")
+                errors += 1
 
             # Flush remaining
             if batch_pg:
@@ -514,36 +770,43 @@ class Upload:
     def on_post(self, req, resp):
         """Handle file upload. Expects multipart form data."""
         # Parse multipart form fields
-        form_data = {}
-        upload = None
+        form_data, upload = _parse_multipart_with_cgi(req)
 
-        # Falcon multipart parsing
-        if hasattr(req, 'get_media'):
+        # Falcon multipart parsing fallback
+        if not upload and hasattr(req, 'get_media'):
             try:
                 form = req.get_media()
                 if hasattr(form, 'items'):
                     for key, val in form.items():
-                        key_name = key.decode('utf-8', errors='replace') if isinstance(key, (bytes, bytearray)) else str(key)
+                        key_name = _normalized_name(key)
                         item = val[0] if isinstance(val, list) and val else val
-                        if key_name == 'file':
+                        if key_name.lower() == 'file':
                             upload = item
                             continue
-                        if hasattr(item, 'text'):
-                            form_data[key_name] = item.text
-                        elif isinstance(item, (bytes, bytearray)):
-                            form_data[key_name] = item.decode('utf-8', errors='replace')
-                        elif item is not None:
-                            form_data[key_name] = str(item)
+                        if key_name in form_data:
+                            continue
+                        text_value = _to_text(_resolve_attr(item, 'text'))
+                        if text_value is None:
+                            text_value = _to_text(_resolve_attr(item, 'value'))
+                        if text_value is None and item is not None:
+                            text_value = _to_text(item)
+                        if text_value is not None:
+                            form_data[key_name] = text_value
 
                 if not upload:
                     for part in form:
                         if not hasattr(part, 'name'):
                             continue
-                        part_name = part.name.decode('utf-8', errors='replace') if isinstance(part.name, (bytes, bytearray)) else str(part.name)
-                        if part_name == 'file':
+                        part_name = _normalized_name(part.name)
+                        if part_name.lower() == 'file':
                             upload = part
                         else:
-                            form_data[part_name] = getattr(part, 'text', '')
+                            if part_name in form_data:
+                                continue
+                            text_value = _to_text(_resolve_attr(part, 'text'))
+                            if text_value is None:
+                                text_value = _to_text(_resolve_attr(part, 'value')) or ''
+                            form_data[part_name] = text_value
             except Exception as e:
                 logger.warning(f"Multipart parse failed: {e}")
 
@@ -589,85 +852,12 @@ class Upload:
 
         # Save to temp file
         job_id = str(uuid.uuid4())[:8]
-        filename = _safe_filename(getattr(upload, 'filename', None) or f"upload_{job_id}.ndjson")
+        filename = _resolve_upload_filename(upload, f"upload_{job_id}.ndjson")
         file_path = os.path.join(self.upload_dir, f"{job_id}_{filename}")
 
         max_upload_bytes = int(os.getenv('UPLOAD_MAX_BYTES', '0') or 0)
-        bytes_written = 0
         try:
-            with open(file_path, 'wb') as f:
-                payload = None
-                for attr in ('data', 'get_data', 'value', 'text', 'get_text'):
-                    candidate = _resolve_attr(upload, attr)
-                    payload = _to_bytes(candidate)
-                    if payload is not None:
-                        break
-
-                if payload is not None:
-                    bytes_written = len(payload)
-                    if max_upload_bytes and bytes_written > max_upload_bytes:
-                        raise ValueError("Upload exceeds configured UPLOAD_MAX_BYTES")
-                    f.write(payload)
-                else:
-                    stream = None
-                    for attr in ('stream', 'file'):
-                        candidate = _resolve_attr(upload, attr)
-                        if candidate is not None:
-                            stream = candidate
-                            break
-
-                    direct_bytes = _to_bytes(stream)
-                    if direct_bytes is not None:
-                        bytes_written = len(direct_bytes)
-                        if max_upload_bytes and bytes_written > max_upload_bytes:
-                            raise ValueError("Upload exceeds configured UPLOAD_MAX_BYTES")
-                        f.write(direct_bytes)
-                    elif stream and hasattr(stream, 'read'):
-                        if hasattr(stream, 'seek'):
-                            try:
-                                stream.seek(0)
-                            except Exception:
-                                pass
-
-                        while True:
-                            chunk = _resolve_awaitable(stream.read(8192))
-                            if not chunk:
-                                break
-                            chunk_bytes = _to_bytes(chunk)
-                            if chunk_bytes is None:
-                                raise ValueError(f"Unsupported upload stream chunk type: {type(chunk).__name__}")
-                            bytes_written += len(chunk_bytes)
-                            if max_upload_bytes and bytes_written > max_upload_bytes:
-                                raise ValueError("Upload exceeds configured UPLOAD_MAX_BYTES")
-                            f.write(chunk_bytes)
-
-                if bytes_written == 0 and hasattr(upload, 'read'):
-                    while True:
-                        chunk = _resolve_awaitable(upload.read(8192))
-                        if not chunk:
-                            break
-                        chunk_bytes = _to_bytes(chunk)
-                        if chunk_bytes is None:
-                            raise ValueError(f"Unsupported upload.read chunk type: {type(chunk).__name__}")
-                        bytes_written += len(chunk_bytes)
-                        if max_upload_bytes and bytes_written > max_upload_bytes:
-                            raise ValueError("Upload exceeds configured UPLOAD_MAX_BYTES")
-                        f.write(chunk_bytes)
-
-                if bytes_written == 0:
-                    direct_upload = _to_bytes(upload)
-                    if direct_upload is not None:
-                        bytes_written = len(direct_upload)
-                        if max_upload_bytes and bytes_written > max_upload_bytes:
-                            raise ValueError("Upload exceeds configured UPLOAD_MAX_BYTES")
-                        f.write(direct_upload)
-
-                if bytes_written == 0:
-                    attrs = []
-                    for attr in ('filename', 'name', 'text', 'value', 'data', 'get_data', 'stream', 'file', 'read'):
-                        if hasattr(upload, attr):
-                            attrs.append(attr)
-                    raise ValueError(f"Unsupported uploaded file payload: {type(upload).__name__} attrs={','.join(attrs)}")
+            bytes_written = _write_upload_to_path(upload, file_path, max_upload_bytes)
         except ValueError as e:
             try:
                 os.remove(file_path)
@@ -689,7 +879,7 @@ class Upload:
             resp.content_type = falcon.MEDIA_JSON
             return
 
-        file_size = os.path.getsize(file_path)
+        file_size = bytes_written
 
         # Create job record in Redis
         set_job(job_id, {
