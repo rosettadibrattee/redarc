@@ -1,236 +1,225 @@
-# RedArc v2 - Modernized Self-Hosted Reddit Archive
+# RedArc (Fork)
 
-A complete reframe of [Yakabuff/redarc](https://github.com/Yakabuff/redarc), modernizing the frontend, search capabilities, and data ingestion workflow.
+Modern self-hosted Reddit archive with:
+- browse + thread views
+- full-text search (advanced filters, partial-word matching, emoji matching)
+- file upload ingestion (`.json`, `.ndjson`, `.zst`, `.zstd`)
+- admin tooling (watch/unlist/progress + filter-based delete)
 
-## What Changed
+This fork keeps the original RedArc data model and workers, while modernizing the frontend and API surface.
 
-### Frontend (Complete Rewrite)
-| Before | After |
-|--------|-------|
-| Bootstrap 2 era styling | Dark theme with JetBrains Mono + Source Serif 4 |
-| `class` instead of `className` | Proper React patterns throughout |
-| Direct DOM manipulation for pagination | State-driven cursor-based pagination |
-| Hardcoded year dropdown (stops at 2023) | Dynamic date range filters |
-| No loading/error/empty states | Full loading skeletons, error boundaries, empty states |
-| Search requires ALL fields | Optional filters, search across all subreddits |
-| No file upload UI | Full drag-and-drop upload with progress tracking |
-| Inline fetch calls everywhere | Centralized API client (`src/utils/api.js`) |
-| No responsive design | Mobile-first responsive layout |
+## What You Get
 
-### Backend (New Endpoints)
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `POST /upload` | POST | Upload NDJSON files via multipart form |
-| `GET /upload/status` | GET | Check upload job progress |
-| `GET /stats` | GET | Archive-wide statistics |
+- React frontend (`/`, `/search`, `/upload`, `/admin`)
+- Falcon API behind NGINX (`/api/*`)
+- Main Postgres DB for canonical submissions/comments
+- FTS Postgres DB for text search
+- Redis-backed job queues/status for ingestion and workers
+- Optional background workers for thread fetch, subreddit polling, indexing, and image downloads
 
-### Architecture Changes
+## Quick Start (Docker Compose)
 
-```
-BEFORE:                              AFTER:
-                                     
-CLI only data ingestion:             UI + CLI data ingestion:
-  $ python3 load_sub.py <file>         Drag & drop in browser
-  $ python3 load_comments.py <file>    OR python3 load_sub.py <file>
-  $ python3 load_sub_fts.py <file>     
-  $ python3 load_comments_fts.py       /upload endpoint handles:
-  $ python3 index.py [subreddit]       - Parsing NDJSON
-                                       - Inserting to main PG
-                                       - Inserting to FTS PG  
-                                       - Auto-indexing subreddits
-                                       - Background processing
-                                       - Progress reporting
+### Prerequisites
+
+- Docker + Docker Compose
+
+### Start
+
+```bash
+cp default.env .env
+# edit .env values (passwords, Reddit API credentials, hostnames)
+docker compose up -d --build
 ```
 
-## Project Structure
+Open:
+- UI: `http://localhost:8088`
+- API through NGINX: `http://localhost:8088/api`
 
-```
-redarc/
-├── api/
-│   ├── app.py              # Updated: CORS middleware, new routes
-│   ├── upload.py            # NEW: File upload + processing + stats
-│   ├── comments.py          # Unchanged
-│   ├── submissions.py       # Unchanged
-│   ├── subreddits.py        # Unchanged
-│   ├── search.py            # Unchanged
-│   ├── submit.py            # Unchanged
-│   ├── media.py             # Unchanged
-│   ├── progress.py          # Unchanged
-│   ├── status.py            # Unchanged
-│   ├── unlist.py            # Unchanged
-│   ├── watch.py             # Unchanged
-│   └── redarc_logger.py     # Unchanged
-│
-├── frontend/
-│   ├── src/
-│   │   ├── main.jsx         # Entry point with router
-│   │   ├── utils/
-│   │   │   └── api.js       # NEW: Centralized API client
-│   │   ├── components/      # NEW: Reusable UI components
-│   │   │   ├── Header.jsx
-│   │   │   ├── Breadcrumb.jsx
-│   │   │   ├── EmptyState.jsx
-│   │   │   ├── Loading.jsx
-│   │   │   ├── Pagination.jsx
-│   │   │   ├── CommentTree.jsx
-│   │   │   └── Toast.jsx
-│   │   └── pages/           # NEW: Page-level components
-│   │       ├── Index.jsx        # Subreddit grid + stats
-│   │       ├── Subreddit.jsx    # Submission list
-│   │       ├── Thread.jsx       # Post + threaded comments
-│   │       ├── Search.jsx       # Full-text search with filters
-│   │       ├── Upload.jsx       # File upload + URL submit
-│   │       └── Admin.jsx        # Watch/unlist/progress
-│   ├── package.json          # Updated deps (Tailwind, Lucide)
-│   └── vite.config.js
-│
-├── scripts/                  # Unchanged (CLI still works)
-├── ingest/                   # Unchanged
-├── docker-compose.yml        # Unchanged
-└── Dockerfile                # Unchanged
-```
+### Main Services
 
-## New API: `/upload`
+- `redarc`: NGINX + API + built frontend
+- `postgres` (`pgsql-dev`): main DB
+- `postgres_fts` (`pgsql-fts`): FTS DB
+- `redis`: queue + upload status store
+- workers: `reddit_worker`, `subreddit_worker`, `index_worker`, `image_downloader`
 
-### POST /upload
-Upload an NDJSON file for processing.
+## Configuration
 
-**Request:** `multipart/form-data`
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `file` | File | Yes | NDJSON file (.json, .ndjson) |
-| `type` | String | No | `submissions`, `comments`, or `auto` (default: auto) |
-| `password` | String | No | Ingest password if INGEST_PASSWORD is set |
-| `target` | String | No | `main`, `fts`, or `both` (default: both) |
-| `auto_index` | String | No | `true` or `false` (default: true) |
+Edit `.env` before running.
 
-**Response:** `202 Accepted`
-```json
-{
-  "status": "accepted",
-  "job_id": "a3f2b1c8",
-  "filename": "RS_2023-01.ndjson",
-  "file_size": 1048576
-}
-```
+### Core
 
-### GET /upload/status
-Check upload job progress.
+- `ADMIN_PASSWORD`: required for admin actions
+- `INGEST_PASSWORD`: required for `/submit` and `/upload` when set
+- `SEARCH_ENABLED=true|false`: enables `/search` route
+- `INGEST_ENABLED=true|false`: enables `/submit` URL ingestion route
+- `PG_*`: main Postgres connection vars
+- `PGFTS_*`: FTS Postgres connection vars
+- `REDIS_HOST`, `REDIS_PORT`
 
-**Query params:** `?job_id=a3f2b1c8` (optional — omit for all jobs)
+### Networking / proxy
 
-**Response:**
-```json
-{
-  "id": "a3f2b1c8",
-  "filename": "RS_2023-01.ndjson",
-  "status": "processing",
-  "lines_processed": 45000,
-  "inserted": 44800,
-  "skipped": 150,
-  "errors": 50,
-  "subreddits": ["programming", "python"]
-}
-```
+- `SERVER_NAME`
+- `REDARC_API` and `REDARC_FE_API` (used by NGINX + frontend build)
+- `API_PORT` and `API_UPSTREAM`
 
-### GET /stats
-Archive statistics.
+### Optional upload tuning
 
-**Response:**
-```json
-{
-  "subreddits": 42,
-  "submissions": 284521,
-  "comments": 3842156,
-  "total_records": 4126677
-}
+- `UPLOAD_MAX_BYTES`: max accepted upload size in bytes (`0` = unlimited)
+- `ADMIN_DELETE_MAX_ROWS`: safety cap for admin delete operation (default `100000`)
+
+## Ingestion
+
+### 1) Upload page (recommended)
+
+Use `/upload` UI.
+
+Supported files:
+- `.json`
+- `.ndjson`
+- `.zst`
+- `.zstd`
+
+Import options:
+- `type`: `auto | submissions | comments`
+- `target`: `main | fts | both`
+- `on_conflict`: `skip | update`
+- `auto_index`: `yes | no`
+
+Notes:
+- uploads are processed async in background jobs
+- status is polled from `/api/upload/status`
+- `.zst`/`.zstd` decompression requires `zstandard` (already installed in the container)
+- in `auto` mode, a file must contain one record type (submissions or comments), not mixed
+
+### 2) Submit Reddit URL
+
+Use `/upload` -> “Submit Reddit URL”, or call `POST /api/submit`.
+
+- Requires `INGEST_ENABLED=true`
+- Requires `INGEST_PASSWORD` if configured
+- Enqueues thread fetch into Redis/RQ workers
+
+### 3) Legacy CLI ingestion (still available)
+
+If you prefer the old path, run scripts manually.
+
+Important:
+- disable ingest/reddit workers while doing bulk manual loads
+- install Python deps locally (`python3`, `pip`, `psycopg2-binary`)
+- decompress `.zst` files first
+
+```bash
+unzstd <submission_file>.zst
+unzstd <comment_file>.zst
+pip install psycopg2-binary
+
+python3 scripts/load_sub.py <path_to_submission_file>
+python3 scripts/load_sub_fts.py <path_to_submission_file>
+python3 scripts/load_comments.py <path_to_comment_file>
+python3 scripts/load_comments_fts.py <path_to_comment_file>
+python3 scripts/index.py [subreddit_name]
+
+# optional
+python3 scripts/unlist.py <subreddit> <true|false>
+python3 scripts/backfill_images.py <subreddit> <after_timestamp_utc> <num_urls>
 ```
 
-## Frontend API Client
+Legacy script DB credentials are hardcoded defaults; edit scripts if your local DB credentials differ.
 
-All API calls are centralized in `frontend/src/utils/api.js`:
+## Search
 
-```javascript
-import { fetchSubreddits, search, uploadFile, fetchUploadStatus } from './utils/api';
+`/search` supports:
+- submissions or comments search
+- optional subreddit (or all subreddits)
+- author filter
+- keywords filter
+- date range (after/before)
+- score / gilded / comment-count filters
+- domain and self-post filters (submissions)
+- partial-word match mode
+- phrase match mode
+- emoji matching
+- sort by new/old/relevance/score/gilded/comment-count (where applicable)
+- pagination with configurable page size
 
-// Fetch subreddits with abort support
-const controller = new AbortController();
-const subs = await fetchSubreddits(controller.signal);
+Search endpoint exists only when `SEARCH_ENABLED=true` and FTS DB is configured.
 
-// Full-text search
-const results = await search({
-  type: 'submission',
-  subreddit: 'programming',
-  query: 'rust',
-  after: '1672531200',
-});
+## Admin
 
-// Upload file
-const job = await uploadFile(fileObject, {
-  type: 'submissions',
-  password: 'mypass',
-  target: 'both',
-  autoIndex: true,
-});
+`/admin` includes:
+- watch/unwatch subreddit
+- unlist/relist subreddit
+- ingest job progress
+- Danger Zone delete-by-filter
 
-// Poll job status
-const status = await fetchUploadStatus(job.job_id);
+Danger Zone behavior:
+- delete target: submissions or comments
+- exactly one subreddit per delete
+- first click runs review (`dry_run`)
+- execute step requires typing `DELETE`
+- admin password is required only for execute step
+
+## API Overview
+
+### Public/browse
+
+- `GET /api/search/subreddits`
+- `GET /api/search/submissions`
+- `GET /api/search/comments`
+- `GET /api/status`
+- `GET /api/stats`
+- `GET /api/media`
+
+### Search
+
+- `GET /api/search` (when enabled)
+
+### Ingest
+
+- `POST /api/upload`
+- `GET /api/upload/status`
+- `POST /api/submit` (when enabled)
+
+### Admin
+
+- `POST /api/watch`
+- `POST /api/unlist`
+- `POST /api/progress`
+- `POST /api/admin/delete`
+
+## Development Notes
+
+- API app entry: `api/app.py`
+- Upload pipeline: `api/upload.py`
+- Search logic: `api/search.py`
+- Admin delete resource: `api/admin_delete.py`
+- Frontend API client: `frontend/src/utils/api.js`
+
+Frontend commands:
+
+```bash
+cd frontend
+npm install
+npm run dev
+npm run build
 ```
 
-## Upload Processing Pipeline
+## Troubleshooting
 
-The upload endpoint replaces the need to run 4 separate CLI scripts. Here's what happens internally:
-
-```
-1. File received via multipart POST
-2. Saved to /tmp/redarc_uploads/
-3. Background thread spawned
-4. NDJSON parsed line-by-line (streaming, low memory)
-5. Each line parsed with same logic as load_sub.py / load_comments.py
-6. Batch INSERT (500 rows) into main PG
-7. Batch INSERT into FTS PG (if target=both|fts)
-8. ON CONFLICT (id) DO NOTHING (skip duplicates)
-9. Auto-index: UPDATE subreddits table with counts
-10. Temp file cleaned up
-11. Job status updated (poll via /upload/status)
-```
-
-**Auto-detection:** When `type=auto`, the parser checks for `title`/`selftext` fields (→ submission) vs `body` field (→ comment). This handles mixed files gracefully.
-
-## Migration Guide
-
-### From v1 to v2
-
-1. **Backend:** Replace `api/app.py` with the new version. Add `api/upload.py`. No other API files changed.
-
-2. **Frontend:** Complete replacement. Delete old `frontend/src/` and replace with new structure.
-
-3. **Docker:** Host port mappings are configurable in `docker-compose.yml`:
-   - `REDARC_HTTP_PORT` (default: `8088`)
-   - `PG_HOST_PORT` (default: `55432`)
-   - `PGFTS_HOST_PORT` (default: `55433`)
-   - `REDIS_HOST_PORT` (default: `56379`)
-   - Internal API bind uses `API_PORT` (default: `18000`)
-
-4. **Data:** No database schema changes. All existing data is preserved.
-
-5. **Env vars:** Add the port env vars above to `.env` if you need custom bindings.
-
-### Breaking Changes
-- Frontend routes changed (but old URL patterns still work via the router)
-- Bootstrap CSS removed entirely (replaced with Tailwind + custom CSS)
-- `class` → `className` throughout (was a React anti-pattern)
-
-## Design System
-
-The modernized frontend uses:
-
-- **Typography:** JetBrains Mono (UI/code) + Source Serif 4 (prose/titles)
-- **Colors:** Dark base (#0a0a0b) with Reddit orange (#ff4500) accent
-- **Components:** All custom — no component library dependency
-- **Icons:** Lucide React (tree-shakeable, 1KB per icon)
-- **Layout:** CSS Grid + Flexbox, responsive breakpoints at 768px
+- `401 Invalid password` on admin actions:
+  - verify `ADMIN_PASSWORD` in container env
+  - for Danger Zone, password is required on execute step
+- `/api/search` missing:
+  - set `SEARCH_ENABLED=true`
+  - ensure FTS DB env vars are valid
+- upload status not shared across workers:
+  - ensure Redis is reachable (`REDIS_HOST` / `REDIS_PORT`)
 
 ## License
 
-MIT — same as original.
+MIT (same as upstream RedArc).
+
+## Credits
+
+- Upstream project: [Yakabuff/redarc](https://github.com/Yakabuff/redarc)

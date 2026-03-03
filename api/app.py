@@ -32,6 +32,7 @@ from search import Search
 from media import Media
 from unlist import Unlist
 from watch import Watch
+from admin_delete import AdminDelete
 from upload import Upload, UploadStatus, Stats
 from dotenv import load_dotenv
 
@@ -107,6 +108,7 @@ status = Status(pg_pool)
 media = Media(os.getenv('IMAGE_PATH'))
 unlist = Unlist(pg_pool)
 watch = Watch(pg_pool)
+admin_delete = AdminDelete(pg_pool, pgfts_pool)
 stats = Stats(pg_pool)
 upload = Upload(pg_pool, pgfts_pool)
 upload_status = UploadStatus()
@@ -121,6 +123,7 @@ app.add_route('/status', status)
 app.add_route('/media', media)
 app.add_route('/unlist', unlist)
 app.add_route('/watch', watch)
+app.add_route('/admin/delete', admin_delete)
 
 # New
 app.add_route('/stats', stats)

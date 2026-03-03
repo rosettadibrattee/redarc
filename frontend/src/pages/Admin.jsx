@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { watchSubreddit, unlistSubreddit, fetchProgress } from '../utils/api';
+import { watchSubreddit, unlistSubreddit, fetchProgress, adminDeleteByFilter, fetchSubreddits } from '../utils/api';
 import { useApi } from '../hooks/useApi';
 import { Loading, Badge, Toast } from '../components/UI';
+import { toUnixTimestamp } from '../utils/format';
 
 export default function AdminPage() {
   const [toast, setToast] = useState(null);
@@ -20,6 +21,21 @@ export default function AdminPage() {
     () => fetchProgress(progressPw),
     [progressPw]
   );
+  const { data: dangerSubreddits } = useApi((s) => fetchSubreddits(s), []);
+
+  // Danger zone (delete by filters)
+  const [dangerPw, setDangerPw] = useState('');
+  const [dangerTarget, setDangerTarget] = useState('submissions');
+  const [dangerSub, setDangerSub] = useState('');
+  const [dangerAuthor, setDangerAuthor] = useState('');
+  const [dangerKeywords, setDangerKeywords] = useState('');
+  const [dangerAfter, setDangerAfter] = useState('');
+  const [dangerBefore, setDangerBefore] = useState('');
+  const [dangerConfirm, setDangerConfirm] = useState('');
+  const [dangerPreview, setDangerPreview] = useState(null);
+  const [dangerPreviewKey, setDangerPreviewKey] = useState('');
+  const [dangerLoading, setDangerLoading] = useState(false);
+  const [dangerDeleting, setDangerDeleting] = useState(false);
 
   const showToast = (type, message) => {
     setToast({ type, message });
@@ -45,6 +61,81 @@ export default function AdminPage() {
       setUnlistSub('');
     } catch (err) {
       showToast('error', err.message);
+    }
+  };
+
+  const buildDangerPayload = (dryRun) => {
+    const normalizedSub = dangerSub.trim().replace(/^r\//i, '').toLowerCase();
+
+    return {
+      password: dryRun ? undefined : dangerPw,
+      dry_run: dryRun,
+      confirm_text: dryRun ? '' : dangerConfirm,
+      target: dangerTarget,
+      subreddit: normalizedSub || undefined,
+      author: dangerAuthor.trim() || undefined,
+      keywords: dangerKeywords.trim() || undefined,
+      after: toUnixTimestamp(dangerAfter)?.toString(),
+      before: toUnixTimestamp(dangerBefore)?.toString(),
+    };
+  };
+
+  const getDangerReviewKey = () => JSON.stringify({
+    target: dangerTarget,
+    subreddit: dangerSub.trim().replace(/^r\//i, '').toLowerCase(),
+    author: dangerAuthor.trim().toLowerCase(),
+    keywords: dangerKeywords.trim(),
+    after: toUnixTimestamp(dangerAfter)?.toString() || '',
+    before: toUnixTimestamp(dangerBefore)?.toString() || '',
+  });
+
+  const handleDangerDelete = async () => {
+    if (!dangerSub.trim()) {
+      showToast('error', 'Enter a subreddit');
+      return;
+    }
+
+    const reviewKey = getDangerReviewKey();
+    const reviewReady = dangerPreview && dangerPreviewKey === reviewKey;
+
+    if (!reviewReady) {
+      setDangerLoading(true);
+      try {
+        const data = await adminDeleteByFilter(buildDangerPayload(true));
+        setDangerPreview(data);
+        setDangerPreviewKey(reviewKey);
+        setDangerConfirm('');
+        showToast('success', `Review ready: ${data.counts?.main || 0} rows matched`);
+      } catch (err) {
+        setDangerPreview(null);
+        setDangerPreviewKey('');
+        showToast('error', err.message);
+      } finally {
+        setDangerLoading(false);
+      }
+      return;
+    }
+
+    if (dangerConfirm !== 'DELETE') {
+      showToast('error', 'Type DELETE to confirm');
+      return;
+    }
+    if (!dangerPw.trim()) {
+      showToast('error', 'Enter admin password');
+      return;
+    }
+    setDangerDeleting(true);
+    try {
+      const data = await adminDeleteByFilter(buildDangerPayload(false));
+      showToast('success', `Deleted ${data.deleted?.main || 0} rows from main DB`);
+      setDangerPreview(null);
+      setDangerPreviewKey('');
+      setDangerConfirm('');
+      setDangerPw('');
+    } catch (err) {
+      showToast('error', err.message);
+    } finally {
+      setDangerDeleting(false);
     }
   };
 
@@ -202,6 +293,135 @@ export default function AdminPage() {
             </table>
           </div>
         )}
+      </div>
+
+      {/* Danger Zone */}
+      <div className="mt-4 p-5 bg-bg-secondary border-2 border-accent rounded-xl">
+        <h3 className="text-[13px] font-semibold uppercase tracking-wider text-text-secondary mb-2">
+          Danger Zone
+        </h3>
+        <p className="text-xs text-text-tertiary mb-4">
+          Permanently delete submissions or comments by filter. This cannot be undone.
+        </p>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+          <div>
+            <label className="block text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1">Target</label>
+            <select
+              className="w-full p-2.5 rounded-lg text-[13px] bg-bg-tertiary border border-border text-text-primary outline-none focus:border-accent transition-colors"
+              value={dangerTarget}
+              onChange={(e) => setDangerTarget(e.target.value)}
+            >
+              <option value="submissions">Submissions</option>
+              <option value="comments">Comments</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1">Subreddit</label>
+            <select
+              className="w-full p-2.5 rounded-lg text-[13px] bg-bg-tertiary border border-border text-text-primary outline-none focus:border-accent transition-colors"
+              value={dangerSub}
+              onChange={(e) => setDangerSub(e.target.value)}
+            >
+              <option value="">Select subreddit</option>
+              {dangerSubreddits?.map((s) => (
+                <option key={s.name} value={s.name}>r/{s.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1">Author</label>
+            <input
+              className="w-full p-2.5 rounded-lg text-[13px] bg-bg-tertiary border border-border text-text-primary outline-none focus:border-accent transition-colors"
+              placeholder="optional"
+              value={dangerAuthor}
+              onChange={(e) => setDangerAuthor(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1">Keywords</label>
+            <input
+              className="w-full p-2.5 rounded-lg text-[13px] bg-bg-tertiary border border-border text-text-primary outline-none focus:border-accent transition-colors"
+              placeholder="optional"
+              value={dangerKeywords}
+              onChange={(e) => setDangerKeywords(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1">After Date</label>
+            <input
+              type="date"
+              className="w-full p-2.5 rounded-lg text-[13px] bg-bg-tertiary border border-border text-text-primary outline-none focus:border-accent transition-colors"
+              value={dangerAfter}
+              onChange={(e) => setDangerAfter(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1">Before Date</label>
+            <input
+              type="date"
+              className="w-full p-2.5 rounded-lg text-[13px] bg-bg-tertiary border border-border text-text-primary outline-none focus:border-accent transition-colors"
+              value={dangerBefore}
+              onChange={(e) => setDangerBefore(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <p className="text-[11px] text-text-tertiary mb-3">
+          Click <span className="font-semibold text-accent">Delete</span> once to review current filters, then enter admin password and type <span className="font-mono">DELETE</span> to execute.
+        </p>
+
+        {dangerPreview && (
+          <div className="p-3 rounded-lg bg-bg-tertiary border border-border mb-3">
+            <div className="text-xs text-text-secondary mb-2">Current filters to be applied:</div>
+            <div className="text-[11px] text-text-tertiary font-mono break-all mb-2">
+              {JSON.stringify(dangerPreview.filters)}
+            </div>
+            <div className="text-xs text-text-secondary">
+              Matching rows: main={dangerPreview.counts?.main || 0}{' '}
+              {dangerPreview.fts_enabled
+                ? `fts=${dangerPreview.counts?.fts == null ? 'unknown' : dangerPreview.counts.fts}`
+                : '(fts disabled)'}
+            </div>
+          </div>
+        )}
+
+        <div className={`grid grid-cols-1 ${dangerPreview ? 'sm:grid-cols-[1fr_1fr_auto]' : 'sm:grid-cols-[1fr_auto]'} gap-3 items-end`}>
+          {dangerPreview ? (
+            <>
+              <div>
+                <label className="block text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1">
+                  Admin Password
+                </label>
+                <input
+                  type="password"
+                  className="w-full p-2.5 rounded-lg text-[13px] bg-bg-tertiary border border-border text-text-primary outline-none focus:border-accent transition-colors"
+                  placeholder="required to execute"
+                  value={dangerPw}
+                  onChange={(e) => setDangerPw(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-text-tertiary uppercase tracking-wider mb-1">
+                  Type DELETE to confirm
+                </label>
+                <input
+                  className="w-full p-2.5 rounded-lg text-[13px] bg-bg-tertiary border border-border text-text-primary outline-none focus:border-accent transition-colors"
+                  placeholder="DELETE"
+                  value={dangerConfirm}
+                  onChange={(e) => setDangerConfirm(e.target.value)}
+                />
+              </div>
+            </>
+          ) : <div />}
+          <button
+            onClick={handleDangerDelete}
+            disabled={dangerLoading || dangerDeleting}
+            className="px-5 py-2.5 rounded-lg text-xs font-semibold uppercase bg-red-700 text-white hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+          >
+            {dangerLoading ? 'Reviewing...' : dangerDeleting ? 'Deleting...' : (dangerPreview ? 'Confirm Delete' : 'Delete')}
+          </button>
+        </div>
       </div>
 
       {toast && <Toast type={toast.type} message={toast.message} />}

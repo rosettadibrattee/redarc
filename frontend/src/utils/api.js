@@ -195,6 +195,16 @@ export async function fetchProgress(password = '') {
   });
 }
 
+// ---- Admin Danger Zone ----
+
+export async function adminDeleteByFilter(payload) {
+  return request('/admin/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
 // ---- Hooks helper ----
 
 /**
